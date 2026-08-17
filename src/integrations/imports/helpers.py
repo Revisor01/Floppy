@@ -87,7 +87,19 @@ def get_existing_media(user):
     for media_type in valid_types:
         media_model = apps.get_model(app_label="app", model_name=media_type)
 
-        for media in media_model.objects.filter(user=user).select_related("item"):
+        # A user can hold several rows for one item -- each play of a movie,
+        # each session of a game -- and only one of them can stand in this
+        # lookup. Order it so the last write wins the oldest row, the one an
+        # importer means when it says "the entry I already track". Without the
+        # ordering, rows created in the same batch tie on created_at and the
+        # winner is whichever the database happens to return, which would let
+        # an importer raise a single session to a lifetime total.
+        rows = (
+            media_model.objects.filter(user=user)
+            .select_related("item")
+            .order_by("-created_at", "-pk")
+        )
+        for media in rows:
             existing[media_type][media.item.source][media.item.media_id] = media
 
     counts = [
