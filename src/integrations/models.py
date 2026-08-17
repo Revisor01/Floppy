@@ -869,6 +869,17 @@ class PSNAccount(models.Model):
     account_id = models.CharField(max_length=32, blank=True, default="")
     online_id = models.CharField(max_length=64, blank=True, default="")
     last_sync_at = models.DateTimeField(null=True, blank=True)
+    synced_playtimes = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            "IGDB media_id to the cumulative PSN minutes already written as "
+            "rows. Each sync stores the difference against this as its own "
+            "session, so it must never be derived from the rows themselves: "
+            "a deleted session would come back, and a manually logged one "
+            "would swallow the next difference."
+        ),
+    )
     connection_broken = models.BooleanField(default=False)
     last_error_message = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)

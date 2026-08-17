@@ -212,7 +212,7 @@ class ImportPSN(TestCase):
     @patch("integrations.imports.psn.services.search")
     @patch("integrations.psn_api.PSNAWP")
     def test_overwrite_updates_progress(self, mock_psnawp, mock_search):
-        """PSN's cumulative duration replaces existing progress on overwrite."""
+        """Playtime added since the last sync is logged as its own session."""
         item = self.existing_game(progress=10)
         mock_psnawp.side_effect = FakePSNAWP(
             [stats("PPSA00001_00", "Halo Infinite", PlatformCategory.PS5, 1250)],
@@ -221,8 +221,15 @@ class ImportPSN(TestCase):
 
         psn.importer(None, self.user, "overwrite")
 
-        game = Game.objects.get(user=self.user, item=item)
-        self.assertEqual(game.progress, 1250)
+        rows = Game.objects.filter(user=self.user, item=item).order_by("pk")
+        self.assertEqual([row.progress for row in rows], [10, 1240])
+        self.assertEqual(
+            sum(row.progress for row in rows),
+            1250,
+            "the rows together must still add up to what PSN reports",
+        )
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.synced_playtimes, {"1": 1250})
 
     @patch("integrations.imports.psn.services.search")
     @patch("integrations.psn_api.PSNAWP")
@@ -245,9 +252,13 @@ class ImportPSN(TestCase):
 
         psn.importer(None, self.user, "overwrite")
 
-        game = Game.objects.get(user=self.user, item=item)
-        self.assertEqual(game.status, Status.COMPLETED.value)
-        self.assertEqual(game.progress, 1250)
+        rows = Game.objects.filter(user=self.user, item=item).order_by("pk")
+        self.assertEqual(sum(row.progress for row in rows), 1250)
+        # The list shows the status of whichever row was active last, so the
+        # session has to carry Completed forward or the game reads as being
+        # back in progress.
+        for row in rows:
+            self.assertEqual(row.status, Status.COMPLETED.value)
 
     @patch("integrations.imports.psn.services.search")
     @patch("integrations.psn_api.PSNAWP")
@@ -287,19 +298,21 @@ class ImportPSN(TestCase):
 
         psn.importer(None, self.user, "overwrite")
 
-        game = Game.objects.get(user=self.user, item=item)
-        self.assertEqual(game.status, Status.COMPLETED.value)
-        self.assertEqual(game.progress, 1250)
+        rows = Game.objects.filter(user=self.user, item=item).order_by("pk")
+        self.assertEqual(sum(row.progress for row in rows), 1250)
+        for row in rows:
+            self.assertEqual(row.status, Status.COMPLETED.value)
 
     @patch("integrations.imports.psn.services.search")
     @patch("integrations.psn_api.PSNAWP")
-    def test_new_mode_leaves_existing_progress_and_status_alone(
+    def test_new_mode_leaves_existing_rows_alone_but_still_logs_sessions(
         self,
         mock_psnawp,
         mock_search,
     ):
-        """The default "new" mode must never touch an existing game's
-        progress or status, only refresh the item metadata.
+        """"New" mode must not edit an existing game's row, but a session is
+        a new row rather than an edit -- without it a schedule left on the
+        default mode would never log anything.
         """
         item = self.existing_game(progress=10)
         recent = timezone.now() - timedelta(days=1)
@@ -318,10 +331,12 @@ class ImportPSN(TestCase):
 
         imported_counts, _ = psn.importer(None, self.user, "new")
 
-        self.assertEqual(imported_counts.get(MediaTypes.GAME.value, 0), 0)
-        game = Game.objects.get(user=self.user, item=item)
-        self.assertEqual(game.progress, 10)
-        self.assertEqual(game.status, Status.PAUSED.value)
+        self.assertEqual(imported_counts.get(MediaTypes.GAME.value, 0), 1)
+        rows = Game.objects.filter(user=self.user, item=item).order_by("pk")
+        original, session = rows
+        self.assertEqual(original.progress, 10)
+        self.assertEqual(original.status, Status.PAUSED.value)
+        self.assertEqual(session.progress, 1240)
 
     @patch("integrations.imports.psn.services.search")
     @patch("integrations.psn_api.PSNAWP")
@@ -344,9 +359,10 @@ class ImportPSN(TestCase):
 
         psn.importer(None, self.user, "overwrite")
 
-        game = Game.objects.get(user=self.user, item=item)
-        self.assertEqual(game.status, Status.DROPPED.value)
-        self.assertEqual(game.progress, 1250)
+        rows = Game.objects.filter(user=self.user, item=item).order_by("pk")
+        self.assertEqual(sum(row.progress for row in rows), 1250)
+        for row in rows:
+            self.assertEqual(row.status, Status.DROPPED.value)
 
     @patch("integrations.imports.psn.services.search")
     @patch("integrations.psn_api.PSNAWP")
@@ -383,9 +399,14 @@ class ImportPSN(TestCase):
 
         _, warnings = psn.importer(None, self.user, "overwrite")
 
-        game = Game.objects.get(user=self.user, item=item)
-        self.assertEqual(game.progress, 1200)
+        rows = Game.objects.filter(user=self.user, item=item)
+        self.assertEqual([row.progress for row in rows], [1200])
         self.assertIn("Halo Infinite PS4EDITION", warnings)
+        # The partial total is below what is on record, so it says "incomplete
+        # data", not "played less". Inventing a session from it would book
+        # hours the user never played.
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.synced_playtimes, {"1": 1200})
 
     @patch("integrations.imports.psn.services.search")
     @patch("integrations.psn_api.PSNAWP")
@@ -407,8 +428,387 @@ class ImportPSN(TestCase):
 
         psn.importer(None, self.user, "overwrite")
 
-        game = Game.objects.get(user=self.user, item=item)
-        self.assertEqual(game.progress, 1200)
+        rows = Game.objects.filter(user=self.user, item=item)
+        self.assertEqual([row.progress for row in rows], [1200])
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.synced_playtimes, {"1": 1200})
+
+    def sync(self, minutes, last_played, mock_psnawp, mock_search, mode="overwrite"):
+        """Run one import reporting a single game at the given total."""
+        mock_psnawp.side_effect = FakePSNAWP(
+            [
+                stats(
+                    "PPSA00001_00",
+                    "Halo Infinite",
+                    PlatformCategory.PS5,
+                    minutes,
+                    last_played,
+                ),
+            ],
+        )
+        mock_search.side_effect = self.search_stub(media_id="1")
+        return psn.importer(None, self.user, mode)
+
+    @patch("integrations.imports.psn.services.search")
+    @patch("integrations.psn_api.PSNAWP")
+    def test_second_import_writes_only_the_added_playtime(
+        self,
+        mock_psnawp,
+        mock_search,
+    ):
+        """PSN reports one lifetime total, so a session is the growth since
+        the last sync -- dated on the day PSN last saw the game.
+        """
+        first = timezone.now() - timedelta(days=3)
+        self.sync(1250, first, mock_psnawp, mock_search)
+        second = timezone.now() - timedelta(days=1)
+        self.sync(1310, second, mock_psnawp, mock_search)
+
+        rows = Game.objects.filter(user=self.user).order_by("pk")
+        self.assertEqual([row.progress for row in rows], [1250, 60])
+        base, session = rows
+        self.assertIsNone(base.end_date, "the first run keeps its history undated")
+        self.assertEqual(session.end_date, second)
+
+    @patch("integrations.imports.psn.services.search")
+    @patch("integrations.psn_api.PSNAWP")
+    def test_unchanged_playtime_writes_no_session(self, mock_psnawp, mock_search):
+        """A sync that finds nothing new must not leave an empty session."""
+        played = timezone.now() - timedelta(days=2)
+        self.sync(1250, played, mock_psnawp, mock_search)
+        self.sync(1250, played, mock_psnawp, mock_search)
+
+        rows = Game.objects.filter(user=self.user)
+        self.assertEqual([row.progress for row in rows], [1250])
+
+    @patch("integrations.imports.psn.services.search")
+    @patch("integrations.psn_api.PSNAWP")
+    def test_playtime_tracked_before_sessions_seeds_from_the_rows(
+        self,
+        mock_psnawp,
+        mock_search,
+    ):
+        """A game tracked before this importer logged sessions has no
+        watermark. The hours already on record stand in for one, so the
+        first session is the growth on top of them, not the whole history.
+        """
+        self.existing_game(progress=1250)
+        played = timezone.now() - timedelta(days=1)
+
+        self.sync(1310, played, mock_psnawp, mock_search)
+
+        rows = Game.objects.filter(user=self.user).order_by("pk")
+        self.assertEqual([row.progress for row in rows], [1250, 60])
+
+    @patch("integrations.imports.psn.services.search")
+    @patch("integrations.psn_api.PSNAWP")
+    def test_incomplete_first_sync_seeds_from_the_rows_not_the_total(
+        self,
+        mock_psnawp,
+        mock_search,
+    ):
+        """Seeding from PSN's total instead of the rows would turn a run that
+        under-reports into a session for playtime already tracked.
+        """
+        self.existing_game(progress=1200)
+        played = timezone.now() - timedelta(days=1)
+
+        self.sync(300, played, mock_psnawp, mock_search)
+        self.sync(1250, played, mock_psnawp, mock_search)
+
+        rows = Game.objects.filter(user=self.user).order_by("pk")
+        self.assertEqual([row.progress for row in rows], [1200, 50])
+
+    @patch("integrations.imports.psn.services.search")
+    @patch("integrations.psn_api.PSNAWP")
+    def test_manually_logged_session_does_not_swallow_the_next_one(
+        self,
+        mock_psnawp,
+        mock_search,
+    ):
+        """Deriving the watermark from the rows would count time the user
+        logged by hand as PSN playtime and drop the next real session.
+        """
+        first = timezone.now() - timedelta(days=3)
+        self.sync(1250, first, mock_psnawp, mock_search)
+        item = Item.objects.get(media_id="1", source=Sources.IGDB.value)
+        Game.objects.create(
+            item=item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+            progress=60,
+            end_date=timezone.now() - timedelta(days=2),
+        )
+
+        self.sync(1310, timezone.now(), mock_psnawp, mock_search)
+
+        psn_rows = Game.objects.filter(user=self.user, notes=psn.IMPORT_NOTE)
+        self.assertEqual(
+            sorted(row.progress for row in psn_rows),
+            [60, 1250],
+            "the 60 minutes PSN added must still be logged",
+        )
+
+    @patch("integrations.imports.psn.services.search")
+    @patch("integrations.psn_api.PSNAWP")
+    def test_deleted_session_is_not_written_again(self, mock_psnawp, mock_search):
+        """Summing the rows to find the watermark would resurrect a session
+        the user deleted on purpose.
+        """
+        self.sync(1250, timezone.now() - timedelta(days=3), mock_psnawp, mock_search)
+        self.sync(1310, timezone.now() - timedelta(days=2), mock_psnawp, mock_search)
+        Game.objects.filter(user=self.user, progress=60).delete()
+
+        self.sync(1340, timezone.now(), mock_psnawp, mock_search)
+
+        rows = Game.objects.filter(user=self.user).order_by("pk")
+        self.assertEqual([row.progress for row in rows], [1250, 30])
+
+    @patch("integrations.imports.psn.services.search")
+    @patch("integrations.psn_api.PSNAWP")
+    def test_a_concurrent_run_does_not_book_the_same_playtime_twice(
+        self,
+        mock_psnawp,
+        mock_search,
+    ):
+        """Raising a total was idempotent; adding a difference is not. A "sync
+        now" finishing inside this run's matching phase has already written
+        the session, and writing it again would double the playtime.
+        """
+        self.sync(1250, timezone.now() - timedelta(days=3), mock_psnawp, mock_search)
+        played = timezone.now() - timedelta(days=1)
+        good = self.search_stub(media_id="1")
+
+        def search_and_sync_concurrently(media_type, query, page, source=None):
+            # Stands in for the other run: it books the session and moves the
+            # watermark on while this one is still matching titles.
+            item = Item.objects.get(media_id="1", source=Sources.IGDB.value)
+            Game.objects.create(
+                item=item,
+                user=self.user,
+                status=Status.IN_PROGRESS.value,
+                progress=60,
+                notes=psn.IMPORT_NOTE,
+                end_date=played,
+            )
+            PSNAccount.objects.filter(user=self.user).update(
+                synced_playtimes={"1": 1310},
+            )
+            return good(media_type, query, page, source=source)
+
+        mock_psnawp.side_effect = FakePSNAWP(
+            [stats("PPSA00001_00", "Halo Infinite", PlatformCategory.PS5, 1310, played)],
+        )
+        mock_search.side_effect = search_and_sync_concurrently
+
+        psn.importer(None, self.user, "overwrite")
+
+        rows = Game.objects.filter(user=self.user).order_by("pk")
+        self.assertEqual(
+            [row.progress for row in rows],
+            [1250, 60],
+            "the 60 minutes the other run logged must not be logged again",
+        )
+
+    @patch("integrations.imports.psn.services.search")
+    @patch("integrations.psn_api.PSNAWP")
+    def test_an_overlapping_run_only_adds_the_part_it_measured(
+        self,
+        mock_psnawp,
+        mock_search,
+    ):
+        """Two runs fetch their totals at different moments, so their sessions
+        overlap rather than match. Keeping ours whole would book the overlap
+        twice; it has to be measured again against what is on record.
+        """
+        self.sync(1250, timezone.now() - timedelta(days=3), mock_psnawp, mock_search)
+        played = timezone.now() - timedelta(days=1)
+        good = self.search_stub(media_id="1")
+
+        def search_and_sync_concurrently(media_type, query, page, source=None):
+            # The other run fetched earlier and saw less: it books 1250 -> 1280
+            # while this one, holding 1310, is still matching.
+            item = Item.objects.get(media_id="1", source=Sources.IGDB.value)
+            Game.objects.create(
+                item=item,
+                user=self.user,
+                status=Status.IN_PROGRESS.value,
+                progress=30,
+                notes=psn.IMPORT_NOTE,
+                end_date=played,
+            )
+            PSNAccount.objects.filter(user=self.user).update(
+                synced_playtimes={"1": 1280},
+            )
+            return good(media_type, query, page, source=source)
+
+        mock_psnawp.side_effect = FakePSNAWP(
+            [stats("PPSA00001_00", "Halo Infinite", PlatformCategory.PS5, 1310, played)],
+        )
+        mock_search.side_effect = search_and_sync_concurrently
+
+        psn.importer(None, self.user, "overwrite")
+
+        rows = Game.objects.filter(user=self.user).order_by("pk")
+        self.assertEqual(
+            [row.progress for row in rows],
+            [1250, 30, 30],
+            "only the 30 minutes past the other run's mark may be added",
+        )
+        self.assertEqual(sum(row.progress for row in rows), 1310)
+
+    @patch("integrations.imports.psn.services.search")
+    @patch("integrations.psn_api.PSNAWP")
+    def test_an_untouched_game_keeps_a_mark_another_run_moved(
+        self,
+        mock_psnawp,
+        mock_search,
+    ):
+        """Writing the whole map back would undo a mark set for a game this
+        run had nothing to add to, handing its playtime to the next sync a
+        second time.
+        """
+        self.sync(1250, timezone.now() - timedelta(days=3), mock_psnawp, mock_search)
+        good = self.search_stub(media_id="1")
+
+        def search_and_sync_concurrently(media_type, query, page, source=None):
+            item = Item.objects.get(media_id="1", source=Sources.IGDB.value)
+            Game.objects.create(
+                item=item,
+                user=self.user,
+                status=Status.IN_PROGRESS.value,
+                progress=60,
+                notes=psn.IMPORT_NOTE,
+                end_date=timezone.now(),
+            )
+            PSNAccount.objects.filter(user=self.user).update(
+                synced_playtimes={"1": 1310},
+            )
+            return good(media_type, query, page, source=source)
+
+        # This run still sees the old total, so it has no session of its own.
+        mock_psnawp.side_effect = FakePSNAWP(
+            [stats("PPSA00001_00", "Halo Infinite", PlatformCategory.PS5, 1250)],
+        )
+        mock_search.side_effect = search_and_sync_concurrently
+
+        psn.importer(None, self.user, "overwrite")
+
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.synced_playtimes, {"1": 1310})
+
+    @patch("integrations.imports.psn.services.search")
+    @patch("integrations.psn_api.PSNAWP")
+    def test_first_sync_of_a_manually_added_game_stays_undated(
+        self,
+        mock_psnawp,
+        mock_search,
+    ):
+        """Connecting PSN after adding a game by hand imports a history PSN
+        kept all along. Dating it would show years of playtime as one
+        marathon on the day PSN last saw the game.
+        """
+        self.existing_game(progress=0, status=Status.PLANNING.value)
+
+        self.sync(1500, timezone.now() - timedelta(days=1), mock_psnawp, mock_search)
+
+        rows = Game.objects.filter(user=self.user).order_by("pk")
+        self.assertEqual([row.progress for row in rows], [0, 1500])
+        self.assertIsNone(rows[1].end_date)
+
+    @patch("integrations.imports.psn.services.search")
+    @patch("integrations.psn_api.PSNAWP")
+    def test_playtime_edited_mid_sync_is_not_reverted(
+        self,
+        mock_psnawp,
+        mock_search,
+    ):
+        """Playtime lives in session rows now, so nothing may write a tracked
+        row's progress back from the value read before the matching phase.
+        """
+        self.existing_game(progress=1250)
+        self.account.synced_playtimes = {"1": 1250}
+        self.account.save(update_fields=["synced_playtimes"])
+        good = self.search_stub(media_id="1")
+
+        def search_and_edit_concurrently(media_type, query, page, source=None):
+            Game.objects.filter(user=self.user, item__media_id="1").update(
+                progress=1400,
+            )
+            return good(media_type, query, page, source=source)
+
+        mock_psnawp.side_effect = FakePSNAWP(
+            [stats("PPSA00001_00", "Halo Infinite", PlatformCategory.PS5, 1250)],
+        )
+        mock_search.side_effect = search_and_edit_concurrently
+
+        psn.importer(None, self.user, "overwrite")
+
+        rows = Game.objects.filter(user=self.user)
+        self.assertEqual([row.progress for row in rows], [1400])
+
+    @patch("integrations.psn_api.PSNAWP")
+    def test_an_empty_library_keeps_marks_another_run_set(self, mock_psnawp):
+        """A sync that finds nothing measured nothing, so it must not write
+        back the marks it read before another run moved them.
+        """
+        self.account.synced_playtimes = {"1": 1250}
+        self.account.save(update_fields=["synced_playtimes"])
+        importer = psn.PSNImporter(self.user, "overwrite")
+        PSNAccount.objects.filter(user=self.user).update(
+            synced_playtimes={"1": 1310},
+        )
+        mock_psnawp.side_effect = FakePSNAWP([])
+
+        importer.import_data()
+
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.synced_playtimes, {"1": 1310})
+
+    @patch("integrations.imports.psn.services.search")
+    @patch("integrations.psn_api.PSNAWP")
+    def test_session_carries_a_completed_status_forward(
+        self,
+        mock_psnawp,
+        mock_search,
+    ):
+        """The list shows the status of the row that was active last, so a
+        session must not pull a finished game back into progress.
+        """
+        self.existing_game(progress=1250, status=Status.COMPLETED.value)
+
+        self.sync(1310, timezone.now(), mock_psnawp, mock_search)
+
+        rows = Game.objects.filter(user=self.user).order_by("pk")
+        self.assertEqual([row.progress for row in rows], [1250, 60])
+        for row in rows:
+            self.assertEqual(row.status, Status.COMPLETED.value)
+
+    @patch("integrations.imports.psn.services.search")
+    @patch("integrations.psn_api.PSNAWP")
+    def test_retracked_game_does_not_bank_a_phantom_session(
+        self,
+        mock_psnawp,
+        mock_search,
+    ):
+        """Keeping the watermark of a deleted game would turn every hour
+        played while it was untracked into one fabricated session.
+        """
+        self.sync(1250, timezone.now() - timedelta(days=5), mock_psnawp, mock_search)
+        # Deleting the game records the tombstone that keeps PSN from
+        # recreating it on the next run.
+        Game.objects.filter(user=self.user).delete()
+        self.sync(1400, timezone.now() - timedelta(days=3), mock_psnawp, mock_search)
+        DeletedMedia.objects.filter(user=self.user, media_id="1").delete()
+
+        self.sync(1500, timezone.now(), mock_psnawp, mock_search)
+
+        rows = Game.objects.filter(user=self.user).order_by("pk")
+        self.assertEqual(
+            [row.progress for row in rows],
+            [1500],
+            "re-tracking starts over from the lifetime total",
+        )
 
     def tombstone(self, media_id):
         """Record that the user deleted this IGDB game locally."""

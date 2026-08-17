@@ -16,6 +16,7 @@ import re
 from collections import defaultdict
 from datetime import timedelta
 
+from django.db import models, transaction
 from django.utils import timezone
 
 import app
@@ -111,7 +112,10 @@ class PSNImporter:
         self.warnings = []
 
         try:
-            self.account = user.psn_account
+            # Fetched rather than taken off the user, whose related object is
+            # cached: a second import on the same instance would otherwise
+            # measure its sessions against the watermark from before the first.
+            self.account = PSNAccount.objects.get(user=user)
         except PSNAccount.DoesNotExist as error:
             msg = "Connect PlayStation Network before importing"
             raise MediaImportError(msg) from error
@@ -129,6 +133,19 @@ class PSNImporter:
         self.existing_media = helpers.get_existing_media(user)
         # Track media the user explicitly deleted, so it isn't recreated
         self.deleted_media = helpers.get_deleted_media(user)
+        # How much of each game's cumulative PSN playtime is already on record.
+        # Read from the account rather than summed from the rows: a session the
+        # user deleted would otherwise be written again on the next run, and one
+        # they logged by hand would swallow the next difference.
+        self.watermarks = dict(self.account.synced_playtimes or {})
+        # The cumulative total each queued session was measured against, so a
+        # concurrent run's work can be subtracted from it before writing.
+        self.session_totals = {}
+        # Games whose watermark must go rather than advance, because the user
+        # stopped tracking them.
+        self.dropped_watermarks = set()
+        self.row_totals = self._load_row_totals()
+        self.protected_statuses = self._load_protected_statuses()
         self.to_update = []
         self.to_update_meta = []
         self.bulk_media = defaultdict(list)
@@ -178,7 +195,10 @@ class PSNImporter:
 
         if not titles:
             logger.info("No PSN titles found for user %s", self.user.username)
-            self._mark_synced()
+            # Nothing was measured, so the marks stay as they are. Writing the
+            # copy read at startup would undo whatever a run that finished in
+            # the meantime recorded.
+            self._mark_synced(store_watermarks=False)
             return {}, "\n".join(dict.fromkeys(self.warnings))
 
         total = len(titles)
@@ -215,40 +235,55 @@ class PSNImporter:
             self._mark_broken(msg)
             raise MediaImportError(msg)
 
-        helpers.bulk_create_media(self.bulk_media, self.user)
+        # Everything below writes as one unit. A run that created session rows
+        # but failed before storing the watermark would report the same minutes
+        # again on the next sync, so the rows and the watermark must not be able
+        # to disagree. The lock serialises a manual "sync now" against the
+        # scheduled run: raising a total was idempotent, adding a difference is
+        # not, and two overlapping runs would otherwise book the same playtime
+        # twice.
+        with transaction.atomic():
+            account = PSNAccount.objects.select_for_update().get(pk=self.account.pk)
+            stored = account.synced_playtimes or {}
+            self._rebase_sessions_on(stored)
+            self._carry_protected_statuses()
+            self.watermarks = self._merge_watermarks(stored)
 
-        if self.to_update:
-            app.models.Game.objects.bulk_update(
-                self.to_update,
-                fields=["progress"],
-            )
-            # Statuses are written with the Completed/Dropped guard enforced
-            # by the database, not only by the snapshot read at the start of
-            # the run: the IGDB matching phase is long, and a user marking a
-            # game Completed or Dropped mid-sync must not have that clobbered
-            # by a status computed from stale data.
-            protected = {Status.COMPLETED.value, Status.DROPPED.value}
-            pks_by_status = defaultdict(list)
-            for game in self.to_update:
-                if game.status not in protected:
-                    pks_by_status[game.status].append(game.pk)
-            for status_value, pks in pks_by_status.items():
-                app.models.Game.objects.filter(pk__in=pks).exclude(
-                    status__in=protected,
-                ).update(status=status_value)
-            logger.info(
-                "Updated %d existing games for user %s",
-                len(self.to_update),
-                self.user.username,
-            )
+            helpers.bulk_create_media(self.bulk_media, self.user)
 
-        if self.to_update_meta:
-            app.models.Item.objects.bulk_update(
-                self.to_update_meta,
-                fields=["title", "image"],
-            )
+            if self.to_update:
+                # Only statuses are written back. Playtime now lives in its own
+                # session rows, and rewriting progress from the value read
+                # before the long matching phase would silently revert an edit
+                # the user made while the sync ran.
+                # Statuses are written with the Completed/Dropped guard enforced
+                # by the database, not only by the snapshot read at the start of
+                # the run: the IGDB matching phase is long, and a user marking a
+                # game Completed or Dropped mid-sync must not have that clobbered
+                # by a status computed from stale data.
+                protected = {Status.COMPLETED.value, Status.DROPPED.value}
+                pks_by_status = defaultdict(list)
+                for game in self.to_update:
+                    if game.status not in protected:
+                        pks_by_status[game.status].append(game.pk)
+                for status_value, pks in pks_by_status.items():
+                    app.models.Game.objects.filter(pk__in=pks).exclude(
+                        status__in=protected,
+                    ).update(status=status_value)
+                logger.info(
+                    "Updated %d existing games for user %s",
+                    len(self.to_update),
+                    self.user.username,
+                )
 
-        self._mark_synced()
+            if self.to_update_meta:
+                app.models.Item.objects.bulk_update(
+                    self.to_update_meta,
+                    fields=["title", "image"],
+                )
+
+            self.account = account
+            self._mark_synced()
 
         imported_counts = {
             media_type: len(media_list)
@@ -261,19 +296,98 @@ class PSNImporter:
         )
         return imported_counts, "\n".join(dict.fromkeys(self.warnings))
 
-    def _mark_synced(self):
+    def _rebase_sessions_on(self, current):
+        """Recompute the queued sessions against what is on record right now.
+
+        The watermarks were read before the IGDB matching phase, which is long
+        enough for another run to finish inside it. Its work shows up here as a
+        higher watermark. The overlap is rarely the whole session -- the two
+        runs fetched their totals at different moments -- so each session is
+        measured again against the newer mark and shortened to the part nobody
+        has booked yet, rather than kept or dropped whole.
+        """
+        kept = []
+        for game in self.bulk_media[MediaTypes.GAME.value]:
+            media_id = game.item.media_id
+            total = self.session_totals.get(id(game))
+            written = current.get(media_id)
+            if total is None or written is None or written <= total - game.progress:
+                kept.append(game)
+                continue
+
+            remaining = total - written
+            if remaining <= 0:
+                logger.info(
+                    "Dropping PSN session for %s: another run already recorded "
+                    "past %s minutes",
+                    media_id,
+                    total,
+                )
+                self.watermarks[media_id] = max(
+                    written,
+                    self.watermarks.get(media_id, 0),
+                )
+                continue
+
+            logger.info(
+                "Shortening PSN session for %s from %s to %s minutes: another "
+                "run recorded up to %s",
+                media_id,
+                game.progress,
+                remaining,
+                written,
+            )
+            game.progress = remaining
+            kept.append(game)
+        self.bulk_media[MediaTypes.GAME.value] = kept
+
+    def _merge_watermarks(self, current):
+        """Fold this run's marks into the stored ones, never lowering a value.
+
+        Only the games this run actually moved may advance. Everything else --
+        a game whose total did not grow, one whose lookup failed, one PSN
+        stopped reporting -- keeps whatever is on record, so writing the dict
+        back cannot undo a mark another run just set and hand its playtime to
+        the next sync a second time.
+        """
+        merged = dict(current)
+        for media_id, minutes in self.watermarks.items():
+            merged[media_id] = max(minutes, current.get(media_id, 0))
+        for media_id in self.dropped_watermarks:
+            merged.pop(media_id, None)
+        return merged
+
+    def _carry_protected_statuses(self):
+        """Re-read the statuses a session row must not undo.
+
+        The map built at startup predates the IGDB matching phase, which runs
+        long enough for the user to mark a game Completed in the meantime. A
+        session created from the stale map would show that game as in progress
+        again, so the rows are checked once more inside the write lock.
+        """
+        protected = self._load_protected_statuses()
+        if not protected:
+            return
+        for game in self.bulk_media[MediaTypes.GAME.value]:
+            status = protected.get(game.item.media_id)
+            if status is not None:
+                game.status = status
+
+    def _mark_synced(self, store_watermarks=True):
         """Record a successful sync on the account row."""
+        fields = [
+            "last_sync_at",
+            "connection_broken",
+            "last_error_message",
+            "updated_at",
+        ]
         self.account.last_sync_at = timezone.now()
         self.account.connection_broken = False
         self.account.last_error_message = ""
-        self.account.save(
-            update_fields=[
-                "last_sync_at",
-                "connection_broken",
-                "last_error_message",
-                "updated_at",
-            ],
-        )
+        if store_watermarks:
+            self.account.synced_playtimes = self.watermarks
+            fields.append("synced_playtimes")
+        self.account.save(update_fields=fields)
 
     def _mark_broken(self, message):
         """Flag the account as needing attention, storing a scrubbed reason."""
@@ -352,17 +466,61 @@ class PSNImporter:
         ):
             aggregate["last_played"] = last_played
 
+    def _game_rows(self):
+        """Return the user's IGDB game rows, the only ones PSN ever writes."""
+        return app.models.Game.objects.filter(
+            user=self.user,
+            item__media_type=MediaTypes.GAME.value,
+            item__source=Sources.IGDB.value,
+        )
+
+    def _load_row_totals(self):
+        """Sum the tracked minutes per game, used to seed a missing watermark.
+
+        Seeding from the rows rather than from PSN keeps an incomplete run --
+        one where a sibling title ID failed to look up -- from inventing a
+        session for playtime that was already on record.
+        """
+        totals = self._game_rows().values("item__media_id").annotate(
+            total=models.Sum("progress"),
+        )
+        return {row["item__media_id"]: row["total"] or 0 for row in totals}
+
+    def _load_protected_statuses(self):
+        """Map each game to a Completed/Dropped status the user set by hand.
+
+        A session row carries the status forward: the list shows the status of
+        whichever row was active last, so a fresh session would otherwise pull
+        a game the user marked Completed back to In progress.
+        """
+        protected = (
+            self._game_rows()
+            .filter(status__in=[Status.COMPLETED.value, Status.DROPPED.value])
+            .values_list("item__media_id", "status")
+        )
+        return dict(protected)
+
     def _store_game(self, media_id, aggregate):
         """Create or update the game a set of PSN titles resolved to."""
-        if media_id in self.deleted_media[MediaTypes.GAME.value][Sources.IGDB.value]:
+        if (
+            media_id in self.deleted_media[MediaTypes.GAME.value][Sources.IGDB.value]
+            and media_id not in self.row_totals
+        ):
             # PSN keeps reporting a title forever once it has been launched,
             # so without this every scheduled sync resurrects a game the user
-            # deleted here on purpose.
+            # deleted here on purpose. The tombstone is recorded per item, and
+            # deleting one session of a game still writes it -- so a game that
+            # kept rows was not untracked, only pruned, and must keep syncing.
             logger.debug(
                 "Skipping deleted PSN game: %s (%s) - deleted locally",
                 aggregate["title"],
                 media_id,
             )
+            # Drop the watermark too. If the user tracks the game again later,
+            # a stale one would turn every hour played in the meantime into a
+            # single phantom session.
+            self.watermarks.pop(media_id, None)
+            self.dropped_watermarks.add(media_id)
             return
 
         minutes = aggregate["minutes"]
@@ -372,23 +530,43 @@ class PSNImporter:
         )
 
         if existing:
-            if self.mode == "overwrite":
-                # PSN's cumulative play duration only ever grows, so an
-                # aggregate below the stored progress never means the user
-                # played less: it means incomplete data -- a sibling title ID
-                # whose IGDB lookup failed this run, or a title whose
-                # playDuration PSN reports as absent (psnawp collapses that
-                # to zero). Mirror the Xbox importer's invariant that unknown
-                # playtime must never overwrite tracked hours: progress is
-                # only ever raised.
-                minutes = max(existing.progress, minutes)
-                existing.progress = minutes
-                if existing.status not in {
-                    Status.COMPLETED.value,
-                    Status.DROPPED.value,
-                }:
-                    existing.status = self._determine_game_status(minutes, last_played)
-                self.to_update.append(existing)
+            # PSN reports one cumulative total per game, never a session list,
+            # so a session is the growth since the last run. The watermark is
+            # what that growth is measured against; without one -- a game
+            # tracked before this importer wrote sessions, or a reconnected
+            # account -- the rows already on record stand in for it.
+            recorded = self.watermarks.get(media_id)
+            first_sync = recorded is None
+            if first_sync:
+                recorded = self.row_totals.get(media_id, existing.progress)
+            delta = minutes - recorded
+
+            if delta > 0:
+                # Without a watermark this run is catching up on a history PSN
+                # kept all along, not reporting a session: the game was tracked
+                # before sessions existed, added by hand, or synced from another
+                # source. Dating that would drop years of playtime onto the day
+                # PSN last saw the game, so it is left undated like a first
+                # import. Only later runs, which measure against a mark this
+                # importer set, describe playtime it actually watched happen.
+                self._add_session(
+                    media_id,
+                    existing.item,
+                    delta,
+                    None if first_sync else last_played,
+                    minutes,
+                )
+                self.watermarks[media_id] = minutes
+            else:
+                # A total below what is on record never means the user played
+                # less: PSN's duration only grows. It means incomplete data --
+                # a sibling title ID whose IGDB lookup failed this run, or a
+                # playDuration PSN reports as absent (psnawp collapses that to
+                # zero). Write nothing and leave the watermark where it is, so
+                # the next complete run measures against the truth.
+                self.watermarks[media_id] = recorded
+                if self.mode == "overwrite":
+                    self._refresh_status(existing, last_played)
 
             item = existing.item
             item.title = aggregate["title"]
@@ -402,6 +580,9 @@ class PSNImporter:
             media_type=MediaTypes.GAME.value,
             defaults={"title": aggregate["title"], "image": aggregate["image"]},
         )
+        # A game seen for the first time carries its whole history as one
+        # undated row. Dating it would drop years of playtime onto whichever
+        # day PSN last saw it, which reads as a single marathon session.
         self.bulk_media[MediaTypes.GAME.value].append(
             app.models.Game(
                 item=item,
@@ -414,6 +595,38 @@ class PSNImporter:
                 end_date=None,
             ),
         )
+        self.watermarks[media_id] = minutes
+
+    def _add_session(self, media_id, item, minutes, last_played, total):
+        """Queue the playtime added since the last sync as its own row."""
+        played_at = last_played
+        if played_at and timezone.is_naive(played_at):
+            played_at = timezone.make_aware(played_at)
+        status = self.protected_statuses.get(media_id)
+        if status is None:
+            status = self._determine_game_status(minutes, last_played)
+        session = app.models.Game(
+            item=item,
+            user=self.user,
+            status=status,
+            score=None,
+            progress=minutes,
+            notes=IMPORT_NOTE,
+            start_date=None,
+            end_date=played_at,
+        )
+        self.bulk_media[MediaTypes.GAME.value].append(session)
+        self.session_totals[id(session)] = total
+
+    def _refresh_status(self, existing, last_played):
+        """Re-evaluate an untouched game's status without moving its playtime."""
+        if existing.status in {Status.COMPLETED.value, Status.DROPPED.value}:
+            return
+        existing.status = self._determine_game_status(
+            existing.progress,
+            last_played,
+        )
+        self.to_update.append(existing)
 
     def _determine_game_status(self, minutes, last_played):
         """Determine game status from PSN playtime and last played date.
