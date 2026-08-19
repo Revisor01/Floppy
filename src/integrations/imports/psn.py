@@ -583,18 +583,21 @@ class PSNImporter:
         # A game seen for the first time carries its whole history as one
         # undated row. Dating it would drop years of playtime onto whichever
         # day PSN last saw it, which reads as a single marathon session.
-        self.bulk_media[MediaTypes.GAME.value].append(
-            app.models.Game(
-                item=item,
-                user=self.user,
-                status=self._determine_game_status(minutes, last_played),
-                score=None,
-                progress=minutes,
-                notes=IMPORT_NOTE,
-                start_date=None,
-                end_date=None,
-            ),
+        first_row = app.models.Game(
+            item=item,
+            user=self.user,
+            status=self._determine_game_status(minutes, last_played),
+            score=None,
+            progress=minutes,
+            notes=IMPORT_NOTE,
+            start_date=None,
+            end_date=None,
         )
+        self.bulk_media[MediaTypes.GAME.value].append(first_row)
+        # Recorded like a session so the write phase can measure it again: two
+        # first runs starting together both hold the whole history, and without
+        # this the second one books it a second time.
+        self.session_totals[id(first_row)] = minutes
         self.watermarks[media_id] = minutes
 
     def _add_session(self, media_id, item, minutes, last_played, total):

@@ -659,6 +659,54 @@ class ImportPSN(TestCase):
 
     @patch("integrations.imports.psn.services.search")
     @patch("integrations.psn_api.PSNAWP")
+    def test_two_first_runs_do_not_import_the_history_twice(
+        self,
+        mock_psnawp,
+        mock_search,
+    ):
+        """Two syncs started together both hold a game's whole history, since
+        neither has a watermark yet. Only one of them may write it.
+        """
+        good = self.search_stub(media_id="1")
+
+        def search_and_sync_concurrently(media_type, query, page, source=None):
+            # The other run finishes first: it creates the game and records
+            # the lifetime total while this one is still matching titles.
+            item = Item.objects.get_or_create(
+                media_id="1",
+                source=Sources.IGDB.value,
+                media_type=MediaTypes.GAME.value,
+                defaults={"title": "Halo Infinite", "image": "http://e/i.jpg"},
+            )[0]
+            if not Game.objects.filter(user=self.user, item=item).exists():
+                Game.objects.create(
+                    item=item,
+                    user=self.user,
+                    status=Status.IN_PROGRESS.value,
+                    progress=1250,
+                    notes=psn.IMPORT_NOTE,
+                )
+                PSNAccount.objects.filter(user=self.user).update(
+                    synced_playtimes={"1": 1250},
+                )
+            return good(media_type, query, page, source=source)
+
+        mock_psnawp.side_effect = FakePSNAWP(
+            [stats("PPSA00001_00", "Halo Infinite", PlatformCategory.PS5, 1250)],
+        )
+        mock_search.side_effect = search_and_sync_concurrently
+
+        psn.importer(None, self.user, "overwrite")
+
+        rows = Game.objects.filter(user=self.user)
+        self.assertEqual(
+            [row.progress for row in rows],
+            [1250],
+            "the history the other run already imported must not be doubled",
+        )
+
+    @patch("integrations.imports.psn.services.search")
+    @patch("integrations.psn_api.PSNAWP")
     def test_an_untouched_game_keeps_a_mark_another_run_moved(
         self,
         mock_psnawp,
